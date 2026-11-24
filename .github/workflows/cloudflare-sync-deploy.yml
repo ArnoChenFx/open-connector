@@ -27,6 +27,18 @@ permissions:
 env:
   NODE_VERSION: "24.22.1"
   UPSTREAM_REPO: "oomol-lab/open-connector"
+  # 默认精选的国内外常用 Provider（适配 Cloudflare Workers Free 套餐的体积与 CPU 限制）。
+  # 可在 GitHub Repository Variables 中设置 CF_PROVIDERS（逗号分隔）覆盖此列表；设为 ALL 则不裁剪。
+  DEFAULT_CF_PROVIDERS: >-
+    feishu,feishu_app_bot,feishu_custom_bot,lark,
+    dingtalk_bot,dingtalk_mcp,wecom_bot,wecom_mcp,
+    tencent_docs,tencent_meeting_mcp,tencent_maps,aliyun_oss,
+    dida365,flomo,bilibili,xiaohongshu_store,deepseek,qwen,
+    github,gitlab,cloudflare,vercel,supabase,linear,jira,sentry,aws_s3,
+    gmail,googlecalendar,googledocs,googledrive,googlesheets,googleslides,googletasks,
+    notion,slack,discord,telegram,outlook,
+    openai,anthropic,perplexity,tavily,exa,firecrawl,jina_ai,brave_search,n8n,
+    twitter,youtube,reddit,figma,airtable,resend,stripe
 
 jobs:
   deploy:
@@ -38,6 +50,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_REF: ${{ inputs.ref }}
+          CF_PROVIDERS_VAR: ${{ vars.CF_PROVIDERS }}
         run: |
           if [ -n "$INPUT_REF" ]; then
             TARGET_REF="$INPUT_REF"
@@ -53,12 +66,18 @@ jobs:
           echo "Target upstream ref: $TARGET_REF"
           echo "target_ref=$TARGET_REF" >> "$GITHUB_OUTPUT"
 
+          PROVIDERS_RAW="${CF_PROVIDERS_VAR:-$DEFAULT_CF_PROVIDERS}"
+          PROVIDERS_CLEAN=$(echo "$PROVIDERS_RAW" | tr -d '[:space:]')
+          PROVIDERS_HASH=$(printf '%s' "$PROVIDERS_CLEAN" | sha256sum | cut -c1-12)
+          echo "providers=$PROVIDERS_CLEAN" >> "$GITHUB_OUTPUT"
+          echo "providers_hash=$PROVIDERS_HASH" >> "$GITHUB_OUTPUT"
+
       - name: Check if this version was already deployed
         id: deploy-cache
         uses: actions/cache@v4
         with:
           path: .cf-deploy-marker
-          key: cf-deployed-${{ steps.resolve.outputs.target_ref }}
+          key: cf-deployed-v2-${{ steps.resolve.outputs.target_ref }}-${{ steps.resolve.outputs.providers_hash }}
 
       - name: Decide whether to deploy
         id: gate
@@ -170,6 +189,45 @@ jobs:
 
             fs.writeFileSync(outputPath, content, "utf8");
             console.log("Generated upstream/wrangler.local.jsonc successfully.");
+          '
+
+      - name: Patch provider allowlist for Cloudflare Free plan
+        if: steps.gate.outputs.should_deploy == 'true'
+        env:
+          CF_PROVIDERS: ${{ steps.resolve.outputs.providers }}
+        run: |
+          if [ "$CF_PROVIDERS" = "ALL" ] || [ -z "$CF_PROVIDERS" ]; then
+            echo "Deploying all upstream providers (no pruning)."
+            exit 0
+          fi
+          node -e '
+            const fs = require("node:fs");
+            const allow = process.env.CF_PROVIDERS.split(",").map((s) => s.trim()).filter(Boolean);
+
+            // 1. Filter discovered providers in scripts/provider-source.ts
+            const sourcePath = "upstream/scripts/provider-source.ts";
+            let sourceCode = fs.readFileSync(sourcePath, "utf8");
+            const anchor = ".sort((a, b) => a.localeCompare(b));";
+            if (!sourceCode.includes(anchor)) {
+              throw new Error("Unexpected scripts/provider-source.ts structure");
+            }
+            const allowLiteral = JSON.stringify(allow);
+            sourceCode = sourceCode.replace(
+              anchor,
+              `.filter((name) => new Set(${allowLiteral}).has(name))\n    ${anchor}`
+            );
+            fs.writeFileSync(sourcePath, sourceCode, "utf8");
+
+            // 2. Skip full-catalog translation completeness check when pruned
+            const catalogPath = "upstream/scripts/generate-catalog.ts";
+            let catalogCode = fs.readFileSync(catalogPath, "utf8");
+            catalogCode = catalogCode.replace(
+              "validateCatalogTranslations(apps);",
+              "// Skipped full-catalog translation check when CF_PROVIDERS pruning is active"
+            );
+            fs.writeFileSync(catalogPath, catalogCode, "utf8");
+
+            console.log(`Enabled provider pruning (${allow.length} configured providers).`);
           '
 
       - name: Install dependencies
