@@ -153,6 +153,13 @@ jobs:
               );
             }
 
+            if (!/"upload_source_maps"\s*:/.test(content)) {
+              content = content.replace(
+                /"triggers"\s*:\s*\{/,
+                `"upload_source_maps": false,\n  "triggers": {`
+              );
+            }
+
             if (process.env.OOMOL_CONNECT_ORIGIN) {
               const originVar = `"vars": { "OOMOL_CONNECT_ORIGIN": ${JSON.stringify(process.env.OOMOL_CONNECT_ORIGIN)} },`;
               content = content.replace(
