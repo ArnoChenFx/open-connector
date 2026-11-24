@@ -1,0 +1,199 @@
+name: Cloudflare Auto Sync & Deploy
+
+on:
+  schedule:
+    # 每天北京时间 10:00 (UTC 02:00) 自动检查上游最新 Release 并部署
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "指定上游 Tag 或分支（留空则自动部署最新正式 Release）"
+        required: false
+        type: string
+        default: ""
+      force_deploy:
+        description: "强制重新部署（即使该版本已经部署过）"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: cloudflare-sync-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24.22.1"
+  UPSTREAM_REPO: "oomol-lab/open-connector"
+
+jobs:
+  deploy:
+    name: Sync & Deploy to Cloudflare Workers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target upstream release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$INPUT_REF" ]; then
+            TARGET_REF="$INPUT_REF"
+          else
+            TARGET_REF=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')
+          fi
+
+          if [ -z "$TARGET_REF" ]; then
+            echo "::error::无法获取上游最新 Release Tag。"
+            exit 1
+          fi
+
+          echo "Target upstream ref: $TARGET_REF"
+          echo "target_ref=$TARGET_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Check if this version was already deployed
+        id: deploy-cache
+        uses: actions/cache@v4
+        with:
+          path: .cf-deploy-marker
+          key: cf-deployed-${{ steps.resolve.outputs.target_ref }}
+
+      - name: Decide whether to deploy
+        id: gate
+        env:
+          CACHE_HIT: ${{ steps.deploy-cache.outputs.cache-hit }}
+          FORCE_DEPLOY: ${{ inputs.force_deploy }}
+          TARGET_REF: ${{ steps.resolve.outputs.target_ref }}
+        run: |
+          if [ "$CACHE_HIT" = "true" ] && [ "$FORCE_DEPLOY" != "true" ]; then
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "版本 ${TARGET_REF} 已经部署过，跳过本次构建与部署。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate required Cloudflare secrets
+        if: steps.gate.outputs.should_deploy == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+        run: |
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CF_D1_DATABASE_ID CF_R2_BUCKET_NAME; do
+            if [ -z "${!name}" ]; then
+              echo "::error::缺少必需的 GitHub Secret: $name"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Checkout upstream (${{ steps.resolve.outputs.target_ref }})
+        if: steps.gate.outputs.should_deploy == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.resolve.outputs.target_ref }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        if: steps.gate.outputs.should_deploy == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: upstream/package-lock.json
+
+      - name: Generate wrangler.local.jsonc from upstream template
+        if: steps.gate.outputs.should_deploy == 'true'
+        env:
+          CF_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
+          CF_D1_DATABASE_NAME: ${{ secrets.CF_D1_DATABASE_NAME }}
+          OOMOL_CONNECT_ORIGIN: ${{ secrets.OOMOL_CONNECT_ORIGIN }}
+          CF_OAUTH_KV_ID: ${{ secrets.CF_OAUTH_KV_ID }}
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const templatePath = "upstream/wrangler.example.jsonc";
+            const outputPath = "upstream/wrangler.local.jsonc";
+            let content = fs.readFileSync(templatePath, "utf8");
+
+            if (!content.includes("<your-d1-database-id>") || !content.includes("<your-bucket-name>")) {
+              throw new Error("wrangler.example.jsonc 模板占位符发生变化，请检查上游模板格式。");
+            }
+
+            content = content
+              .replace("<your-d1-database-id>", process.env.CF_D1_DATABASE_ID)
+              .replace("<your-bucket-name>", process.env.CF_R2_BUCKET_NAME);
+
+            if (process.env.CF_WORKER_NAME) {
+              content = content.replace(
+                /"name"\s*:\s*"open-connector"/,
+                `"name": ${JSON.stringify(process.env.CF_WORKER_NAME)}`
+              );
+            }
+
+            if (process.env.CF_D1_DATABASE_NAME) {
+              content = content.replace(
+                /"database_name"\s*:\s*"open-connector"/,
+                `"database_name": ${JSON.stringify(process.env.CF_D1_DATABASE_NAME)}`
+              );
+            }
+
+            if (process.env.CF_OAUTH_KV_ID) {
+              content = content.replace(
+                /\/\/\s*"kv_namespaces"\s*:\s*\[\{\s*"binding"\s*:\s*"OAUTH_KV",\s*"id"\s*:\s*"<oauth-kv-id>"\s*\}\],/,
+                `"kv_namespaces": [{ "binding": "OAUTH_KV", "id": ${JSON.stringify(process.env.CF_OAUTH_KV_ID)} }],`
+              );
+            }
+
+            if (process.env.OOMOL_CONNECT_ORIGIN) {
+              const originVar = `"vars": { "OOMOL_CONNECT_ORIGIN": ${JSON.stringify(process.env.OOMOL_CONNECT_ORIGIN)} },`;
+              content = content.replace(
+                /"triggers"\s*:\s*\{/,
+                `${originVar}\n  "triggers": {`
+              );
+            }
+
+            fs.writeFileSync(outputPath, content, "utf8");
+            console.log("Generated upstream/wrangler.local.jsonc successfully.");
+          '
+
+      - name: Install dependencies
+        if: steps.gate.outputs.should_deploy == 'true'
+        working-directory: upstream
+        run: npm ci
+
+      - name: Apply remote D1 migrations
+        if: steps.gate.outputs.should_deploy == 'true'
+        working-directory: upstream
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_D1_DATABASE_NAME: ${{ secrets.CF_D1_DATABASE_NAME }}
+        run: |
+          DB_NAME="${CF_D1_DATABASE_NAME:-open-connector}"
+          npx wrangler d1 migrations apply "$DB_NAME" --remote --config wrangler.local.jsonc
+
+      - name: Deploy to Cloudflare Workers
+        if: steps.gate.outputs.should_deploy == 'true'
+        working-directory: upstream
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npm run deploy:cloudflare
+
+      - name: Save deployment marker
+        if: steps.gate.outputs.should_deploy == 'true'
+        env:
+          TARGET_REF: ${{ steps.resolve.outputs.target_ref }}
+        run: |
+          mkdir -p .cf-deploy-marker
+          echo "$TARGET_REF" > .cf-deploy-marker/version
+          echo "已成功部署上游版本 **${TARGET_REF}** 到 Cloudflare Workers。" >> "$GITHUB_STEP_SUMMARY"
